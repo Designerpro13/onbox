@@ -1,0 +1,33 @@
+# OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Local rclone config (don't commit!)
+.config/rclone/
+rclone.conf
+
+# Virtual environments
+venv/
+.env
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.swp

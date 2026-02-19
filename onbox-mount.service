@@ -1,0 +1,21 @@
+[Unit]
+Description=Onbox Google Drive Mount
+Documentation=https://github.com/<you>/onbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%u
+ExecStart=/usr/bin/rclone mount drive: %h/Drive \
+  --vfs-cache-mode writes \
+  --dir-cache-time 12h \
+  --poll-interval 30s
+ExecStop=/bin/fusermount -u %h/Drive
+Restart=on-failure
+RestartSec=5
+StandardError=journal
+StandardOutput=journal
+
+[Install]
+WantedBy=default.target
