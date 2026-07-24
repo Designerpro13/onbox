@@ -1,265 +1,202 @@
 # onbox
 
-**Minimal, secure Google Drive CLI wrapper built on rclone.**
+A small Linux command-line wrapper around [rclone](https://rclone.org/) for explicit Google Drive uploads and an optional systemd-managed FUSE mount.
 
-A frictionless command-line tool for uploading files to Google Drive without the bloat of sync daemons, file watching, or always-on background processes. Designed for manual workflows that respect your storage and security.
+## What it does
 
----
+- `onbox push <file>` uploads one regular file directly with `rclone copy` and live progress.
+- `onbox ls` lists files visible through the configured `drive:` remote.
+- `onbox mount` mounts `drive:` at `~/Drive` using a systemd user service.
+- `onbox umount` stops that service and unmounts the drive.
 
-## Features
+A push does **not** require or start the mount. The upload runs in the foreground, so closing the terminal interrupts it. The optional mount service is independent of the terminal, but it remains active until stopped or until the user systemd manager exits; there is no automatic inactivity timeout.
 
-- **`onbox push <file>`** — Upload files with live progress
-- **Auto-mount on demand** — Automatically mounts Google Drive when needed
-- **Background service** — Runs via systemd, survives terminal close
-- **Smart unmount** — Auto-unmounts after 5 minutes of inactivity
-- **Minimal OAuth** — Uses only `drive.file` scope
-- **No sync daemon** — No persistent background processes
-- **Clean lifecycle** — Proper service management, no shell hacks
+## Requirements and platform support
 
----
+onbox currently supports **Linux systems with systemd user services**. The installer intentionally rejects macOS and root execution because the mount implementation is a per-user systemd service. macOS users can use rclone directly.
 
-## Quick Start
+Required:
 
-### Prerequisites
+- Bash
+- rclone
+- systemd with a working user manager
+- Standard Linux utilities (`install`, `mountpoint`, `realpath`, and coreutils)
+
+A FUSE package is also required for `onbox mount`; `push` and `ls` do not need FUSE. For example, on Ubuntu/Debian:
 
 ```bash
-# Ubuntu 22.04+
-sudo apt install rclone
-
-# macOS
-brew install rclone
+sudo apt update
+sudo apt install rclone fuse3
 ```
 
-### Install
+## Install
 
 ```bash
-git clone https://github.com/<you>/onbox.git
+git clone https://github.com/Designerpro13/onbox.git
 cd onbox
-
-sudo cp bin/onbox /usr/local/bin/
-sudo chmod +x /usr/local/bin/onbox
-
-mkdir -p ~/.config/systemd/user
-cp systemd/onbox-mount.service ~/.config/systemd/user/
-systemctl --user daemon-reload
+bash install.sh
 ```
 
-### Configure rclone
+The installer uses the files in its own directory, so it can be invoked from another working directory. It installs only for the current user and must not be run with `sudo`:
+
+- CLI: `~/.local/bin/onbox`
+- Service: `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/onbox-mount.service`
+
+If `~/.local/bin` is not in `PATH`, the installer prints the shell configuration line to add. `ONBOX_BIN_DIR` may be set to choose another user-writable CLI directory.
+
+The installed service records the absolute `rclone` executable found during installation. Rerun the installer if rclone moves.
+
+## Configure rclone
+
+Create a Google Drive remote named exactly `drive`:
 
 ```bash
 rclone config
+rclone lsd drive:
 ```
 
-- **Type:** `drive`
-- **Scope:** `drive.file` (recommended)
-- **Name remote:** `drive`
+Choose the Google Drive backend and an OAuth scope suitable for your use. onbox does **not** select or enforce a scope. The restricted `drive.file` scope limits access to files created or explicitly opened by the application and may prevent listing or managing existing Drive content. Features such as broad existing-file access or some Shared Drive workflows can require a broader scope; review Google's and rclone's scope descriptions before granting it.
 
-Test:
-
-```bash
-rclone ls drive:
-```
-
----
+The remote name is currently fixed as `drive:` in both the CLI and service. Creating a separate rclone `crypt` remote does not make onbox use it automatically.
 
 ## Usage
 
-### Upload a file
-
 ```bash
-onbox push myfile.txt
-```
+# Upload one file to the root of drive:
+onbox push ./report.pdf
 
-The script will:
-1. Check if Google Drive is mounted
-2. Auto-mount if needed (background)
-3. Upload the file
-4. Schedule auto-unmount after inactivity
-
-### List remote files
-
-```bash
+# List files visible through drive:
 onbox ls
+
+# Optional FUSE mount
+onbox mount
+ls ~/Drive
+onbox umount
+
+# Help
+onbox help
 ```
 
-### Manual mount/unmount
+`push` accepts exactly one readable regular file. It canonicalizes the local path before passing it to rclone so a filename cannot be mistaken for a flag or remote.
+
+## How it works
+
+### Direct upload
+
+```text
+onbox push FILE -> validate and canonicalize FILE -> rclone copy FILE drive:
+```
+
+No mount or background process is created. A successful return means rclone completed the foreground copy.
+
+### Optional mount
+
+```text
+onbox mount -> systemctl --user start onbox-mount.service
+             -> rclone mount drive: ~/Drive
+
+onbox umount -> systemctl --user stop onbox-mount.service
+```
+
+The service creates `~/Drive`, runs unprivileged as the current user, applies a restrictive `0077` umask, and asks rclone to shut down cleanly with `SIGINT`. It uses VFS write caching, a 12-hour directory cache, and 30-second polling.
+
+## Security notes
+
+- onbox never runs rclone as root and the installer does not use `sudo`.
+- OAuth permissions are determined entirely by your rclone configuration; verify the selected scope yourself.
+- rclone's configuration contains sensitive OAuth material. Its default obfuscation is not equivalent to secure encryption. Restrict file permissions and use rclone's configuration-password feature if appropriate. Locate the active file with `rclone config file`.
+- A mounted remote exposes accessible Drive content to processes running as your user. Unmount it when it is not needed.
+- VFS writes may be cached locally by rclone, normally below the user cache directory. Protect the local account and disk accordingly.
+- onbox does not provide content encryption. To use an rclone `crypt` remote today, invoke rclone directly or modify the configured remote in both `onbox` and `onbox-mount.service` before installation.
+- Do not enable systemd lingering merely to make uploads survive logout: uploads are foreground operations and lingering only affects the optional mount service.
+
+## Service lifecycle and logout
+
+The mount survives closing its launching terminal because systemd owns it. On many systems the user manager—and therefore the mount—stops at logout. Administrators can enable lingering with:
 
 ```bash
-onbox mount
+loginctl enable-linger "$USER"
+```
+
+Lingering keeps user services running without an active login, which increases the time the remote stays mounted. Enable it only if that behavior is wanted.
+
+## Troubleshooting
+
+Check configuration and direct access:
+
+```bash
+rclone config file
+rclone lsd drive:
+```
+
+Inspect mount failures:
+
+```bash
+systemctl --user status onbox-mount.service
+journalctl --user -u onbox-mount.service -n 50
+```
+
+Check the mount and stop it normally:
+
+```bash
+mountpoint ~/Drive
 onbox umount
 ```
 
----
+If rclone was killed and left an orphaned FUSE mount, try the unprivileged helper available on the system:
 
-## How It Works
-
-**Workflow:**
-```
-onbox push file.txt
-  ↓
-Check if ~/Drive is mounted?
-  ↓ (if not)
-Start systemd service (background)
-  ↓
-Upload via rclone
-  ↓
-Start 5-min inactivity timer
-  ↓ (if idle)
-Auto-unmount
+```bash
+fusermount3 -u ~/Drive
+# Older FUSE installations may use: fusermount -u ~/Drive
 ```
 
-**Why systemd?**
-- Decoupled from terminal — survives logout
-- Proper lifecycle — no `&` background hacks
-- Clean recovery — auto-restart on failure
-- Standard — uses OS-native service management
+If the service cannot find rclone after rclone was moved or replaced, rerun `bash install.sh` so its absolute path is regenerated.
 
----
+## Project layout
 
-## Architecture
-
-```
+```text
 onbox/
-├── bin/onbox                    # Main CLI script
-├── systemd/
-│   └── onbox-mount.service     # systemd user service
-├── docs/
-│   └── architecture.md          # Deep dive
+├── onbox                  # Bash CLI
+├── onbox-mount.service    # systemd user-service source
+├── install.sh             # Per-user installer
+├── architecture.md        # Design and security details
 ├── README.md
 └── LICENSE
 ```
 
-**Key design choices:**
-- Mount point: `~/Drive`
-- Service: systemd user service (not system-wide)
-- Cache: 12-hour directory cache
-- Auto-unmount: 300 seconds inactivity timeout
-- Scope: `drive.file` (only files you create)
+## Limitations
 
----
+- Linux/systemd only
+- One fixed remote (`drive:`) and mount point (`~/Drive`)
+- One file per `push`; no synchronization or directory upload interface
+- No automatic unmount timer
+- No detached/resumable upload management
+- No automatic crypt-remote selection
 
-## Security Model
+Use rclone directly for synchronization, custom destinations, detached execution, or advanced filtering.
 
-✅ **What we do right:**
-- Minimal OAuth scope — no read-all permissions
-- No persistent daemon — smaller attack surface
-- Mount runs unprivileged — as your user
-- No auto-sync — you decide what's uploaded
-- Config isolated — `~/.config/rclone/rclone.conf`
+## Uninstall
 
-⚠️ **What you should know:**
-- rclone credentials stored in plaintext (use `rclone config` encryption)
-- Google Drive is eventually consistent — small sync delays normal
-- Mount can be slow on large folders (use for upload, not browsing)
-
-**Optional: Enable encryption**
-
-Use rclone's `crypt` remote for end-to-end encryption:
+Stop the mount first, then remove the installed files:
 
 ```bash
-rclone config
-# Create "crypt" remote pointing to "drive:"
-onbox push file.txt  # Will encrypt automatically
+onbox umount
+rm -f ~/.local/bin/onbox
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/onbox-mount.service"
+systemctl --user daemon-reload
 ```
 
----
-
-## Optional: Survive Logout
-
-By default, the mount stops when you log out. To keep it alive:
-
-```bash
-loginctl enable-linger $USER
-```
-
-Now systemd mounts persist across login sessions.
-
----
-
-## Troubleshooting
-
-**Mount fails to start**
-```bash
-systemctl --user status onbox-mount.service
-systemctl --user start onbox-mount.service
-```
-
-**Check if mounted**
-```bash
-mountpoint ~/Drive
-ls ~/Drive
-```
-
-**Manual unmount stuck**
-```bash
-sudo fusermount -u ~/Drive
-```
-
-**Reset service**
-```bash
-systemctl --user reset-failed onbox-mount.service
-```
-
----
-
-## Philosophy
-
-This tool is **not** a Dropbox clone. It favors:
-
-- **Explicit control** over magic
-- **Manual workflows** over continuous sync
-- **Minimal scope** over maximum features
-- **CLI-first** over GUI clutter
-
-Use it for uploading, archiving, or backing up files. Don't use it for folder sync or file sharing.
-
----
-
-## Roadmap
-
-Future improvements:
-- [ ] Config file support (timeout, mount point)
-- [ ] Shell completion (bash, zsh)
-- [ ] Encryption-mode toggle (`--crypt`)
-- [ ] Install script
-- [ ] Version flag (`--version`)
-- [ ] Idle detection based on network traffic (not just open files)
-
----
-
-## License
-
-MIT — Use freely, modify, distribute.
-
----
+Adjust the CLI path if `ONBOX_BIN_DIR` was used.
 
 ## Contributing
 
-Found a bug? Have ideas?
+Test changes on a Linux system with systemd user services. For mount bugs, include:
 
-1. Test on Ubuntu 22.04+
-2. Open an issue or PR
-3. Include `systemctl --user status onbox-mount.service` output if mount-related
+```bash
+systemctl --user status onbox-mount.service
+journalctl --user -u onbox-mount.service -n 50
+```
 
----
+## License
 
-## FAQ
-
-**Q: Why not use Google Drive's official CLI?**  
-A: They don't have one. This is minimal, open, and rclone-based.
-
-**Q: Can I use this with Shared Drives?**  
-A: Yes. During `rclone config`, enable "Team Drive" and point to your shared drive ID.
-
-**Q: Does this sync my folders?**  
-A: No. It's upload-only, by design. Use `rclone sync` if you want bidirectional sync.
-
-**Q: What if I close the terminal while uploading?**  
-A: The upload continues. systemd keeps the mount alive. You're good.
-
-**Q: Can I have multiple mounts?**  
-A: Yes. Create separate services: `onbox-mount-drive1.service`, `onbox-mount-drive2.service`, etc.
-
----
-
-**Made with ❤️ for minimal workflows.**
+MIT — see [LICENSE](LICENSE).

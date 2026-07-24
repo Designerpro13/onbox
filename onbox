@@ -1,129 +1,115 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# onbox — Minimal secure Google Drive CLI wrapper
+# onbox — minimal Google Drive CLI wrapper
 # Usage: onbox push <file> | onbox mount | onbox umount | onbox ls
 #
 
+set -o errexit
+set -o nounset
 set -o pipefail
 
-# Configuration
 readonly REMOTE="drive:"
 readonly MOUNTPOINT="$HOME/Drive"
 readonly SERVICE="onbox-mount.service"
-readonly TIMEOUT=300  # 5 minutes inactivity
-
-# Colors (optional, for cleaner output)
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
-readonly NC='\033[0m' # No Color
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
+readonly NC='\033[0m'
 
 log_info() {
-    echo -e "${GREEN}→${NC} $1"
+    printf '%b\n' "${GREEN}→${NC} $*"
 }
 
 log_error() {
-    echo -e "${RED}✗${NC} $1" >&2
+    printf '%b\n' "${RED}✗${NC} $*" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    printf '%b\n' "${YELLOW}⚠${NC} $*"
 }
 
-# Check if drive is mounted
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        log_error "Required command not found: $1"
+        return 1
+    }
+}
+
 is_mounted() {
-    mountpoint -q "$MOUNTPOINT"
+    mountpoint -q -- "$MOUNTPOINT"
 }
 
-# Start the mount service
 start_mount() {
-    mkdir -p "$MOUNTPOINT" || {
+    require_command systemctl
+    require_command mountpoint
+
+    mkdir -p -- "$MOUNTPOINT" || {
         log_error "Failed to create mount directory: $MOUNTPOINT"
         return 1
     }
 
     log_info "Starting Google Drive mount..."
-    systemctl --user start "$SERVICE" || {
-        log_error "Failed to start systemd service"
-        return 1
-    }
-
-    # Wait for mount to stabilize (rclone needs a moment)
-    sleep 2
-
-    if is_mounted; then
-        log_info "Google Drive mounted at $MOUNTPOINT"
-        return 0
-    else
-        log_error "Mount started but drive not accessible"
+    if ! systemctl --user start "$SERVICE"; then
+        log_error "Failed to start $SERVICE"
+        log_error "Inspect logs with: journalctl --user -u $SERVICE -n 50"
         return 1
     fi
+
+    local attempt
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        if is_mounted; then
+            log_info "Google Drive mounted at $MOUNTPOINT"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    log_error "The service started, but $MOUNTPOINT did not become a mount point"
+    log_error "Inspect logs with: journalctl --user -u $SERVICE -n 50"
+    return 1
 }
 
-# Stop the mount service
 stop_mount() {
-    if ! is_mounted; then
-        log_warn "Drive not currently mounted"
+    require_command systemctl
+
+    if ! systemctl --user is-active --quiet "$SERVICE"; then
+        log_warn "Mount service is not active"
         return 0
     fi
 
     log_info "Unmounting Google Drive..."
-    systemctl --user stop "$SERVICE" || {
-        log_error "Failed to stop service. Try: sudo fusermount -u $MOUNTPOINT"
+    if ! systemctl --user stop "$SERVICE"; then
+        log_error "Failed to stop $SERVICE"
         return 1
-    }
+    fi
 
-    sleep 1
     log_info "Unmounted"
-    return 0
 }
-
-# Schedule auto-unmount after inactivity timeout
-auto_timeout() {
-    (
-        sleep "$TIMEOUT"
-
-        # Check if any files are open in the mount
-        if ! lsof +D "$MOUNTPOINT" >/dev/null 2>&1; then
-            # No open files, safe to unmount
-            systemctl --user stop "$SERVICE" 2>/dev/null
-        fi
-    ) &
-}
-
-# ============================================================================
-# Commands
-# ============================================================================
 
 cmd_push() {
-    local file="$1"
-
-    if [ -z "$file" ]; then
+    if (( $# != 1 )); then
         log_error "Usage: onbox push <file>"
+        return 2
+    fi
+
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        log_error "Not a regular file: $file"
+        return 1
+    fi
+    if [[ ! -r "$file" ]]; then
+        log_error "File is not readable: $file"
         return 1
     fi
 
-    if [ ! -e "$file" ]; then
-        log_error "File not found: $file"
-        return 1
-    fi
+    require_command rclone
+    require_command realpath
 
-    # Check if mounted, mount if needed
-    if ! is_mounted; then
-        start_mount || return 1
-    fi
-
-    # Upload the file
-    log_info "Uploading $(basename "$file") to Google Drive..."
+    # An absolute local path cannot be mistaken for an rclone flag or remote.
+    file="$(realpath -- "$file")"
+    log_info "Uploading $(basename -- "$file") to $REMOTE"
     if rclone copy "$file" "$REMOTE" --progress; then
         log_info "Upload complete"
-        # Schedule unmount after inactivity
-        auto_timeout
-        return 0
     else
         log_error "Upload failed"
         return 1
@@ -131,8 +117,9 @@ cmd_push() {
 }
 
 cmd_mount() {
+    require_command mountpoint
     if is_mounted; then
-        log_warn "Drive already mounted at $MOUNTPOINT"
+        log_warn "Drive is already mounted at $MOUNTPOINT"
         return 0
     fi
     start_mount
@@ -143,57 +130,55 @@ cmd_umount() {
 }
 
 cmd_ls() {
-    log_info "Listing files on Google Drive..."
+    require_command rclone
+    log_info "Listing files on $REMOTE"
     rclone ls "$REMOTE"
 }
 
 cmd_help() {
-    cat <<EOF
-onbox — Minimal secure Google Drive CLI
+    cat <<'EOF'
+onbox — minimal Google Drive CLI
 
 USAGE:
-  onbox push <file>     Upload file to Google Drive
-  onbox mount          Manually mount Google Drive
-  onbox umount         Manually unmount Google Drive
-  onbox ls             List files on Google Drive
-  onbox help           Show this help
+  onbox push <file>     Upload one file directly with rclone
+  onbox mount           Mount drive: at ~/Drive using a systemd user service
+  onbox umount          Stop the mount service
+  onbox ls              List files visible through drive:
+  onbox help            Show this help
 
-EXAMPLES:
-  onbox push document.pdf
-  onbox push ~/Downloads/photo.jpg
-  onbox ls
-
-For more info: https://github.com/<you>/onbox
+Closing the terminal interrupts push. The optional mount service is independent
+of the terminal until it is stopped with `onbox umount`.
 EOF
 }
 
-# ============================================================================
-# Main
-# ============================================================================
-
 main() {
     local command="${1:-help}"
+    if (( $# > 0 )); then
+        shift
+    fi
 
     case "$command" in
-        push)
-            cmd_push "$2"
-            ;;
+        push) cmd_push "$@" ;;
         mount)
+            (( $# == 0 )) || { log_error "Usage: onbox mount"; return 2; }
             cmd_mount
             ;;
         umount)
+            (( $# == 0 )) || { log_error "Usage: onbox umount"; return 2; }
             cmd_umount
             ;;
         ls)
+            (( $# == 0 )) || { log_error "Usage: onbox ls"; return 2; }
             cmd_ls
             ;;
         help|--help|-h)
+            (( $# == 0 )) || { log_error "Usage: onbox help"; return 2; }
             cmd_help
             ;;
         *)
             log_error "Unknown command: $command"
             cmd_help
-            return 1
+            return 2
             ;;
     esac
 }
